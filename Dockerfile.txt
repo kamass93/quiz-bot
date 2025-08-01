@@ -1,0 +1,25 @@
+# Usa un'immagine base di Python che sia compatibile con le tue librerie
+# python:3.12-slim-bookworm è una buona scelta per Debian 12 (Bookworm)
+FROM python:3.12-slim-bookworm
+
+# Imposta la directory di lavoro nel container
+WORKDIR /app
+
+# Copia il file dei requisiti e installa le dipendenze
+# Aggiorna pip e setuptools per evitare problemi di compilazione
+RUN pip install --no-cache-dir --upgrade pip setuptools
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia il resto del codice della tua applicazione
+COPY . .
+
+# Espone la porta su cui il tuo bot ascolterà le richieste (Cloud Run usa 8080)
+# Il tuo codice bot DEVE ascoltare sulla porta fornita dalla variabile d'ambiente PORT.
+# Esempio: port = int(os.environ.get("PORT", 8080))
+ENV PORT 8080
+
+# Comando per avviare il tuo bot
+# Sostituito 'your_bot_script.py' con il tuo file principale 'quiz_bot.py'
+CMD ["python", "quiz_bot.py"]
