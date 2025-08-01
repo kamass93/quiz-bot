@@ -1,5 +1,5 @@
-python-telegram-bot==20.3
-pandas==2.0.3
-Pillow==10.0.0
-openpyxl==3.1.2
-python-dotenv==1.0.0
+python-telegram-bot==21.3
+Flask==3.0.3 # O una versione recente compatibile
+pandas
+openpyxl # Necessario per leggere .xlsx
+Pillow # Per la generazione delle immagini
