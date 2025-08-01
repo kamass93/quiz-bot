@@ -3,4 +3,3 @@ pandas==2.0.3
 Pillow==10.0.0
 openpyxl==3.1.2
 python-dotenv==1.0.0
-sqlite3==2.6.0  # Già incluso in Python, ma esplicito per chiarezza
