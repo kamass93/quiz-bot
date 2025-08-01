@@ -16,6 +16,9 @@ from telegram.ext import (
     ConversationHandler,
 )
 
+# Aggiungi per i webhook (se non usi Flask/FastAPI direttamente)
+from telegram.ext import WebhookHandler
+
 # Configurazione
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -23,7 +26,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = "7305825990:AAHQYjZ54g8TqmEgjV26sPEAF3V_W9FKeVc"
+# Recupera il token da una variabile d'ambiente (MIGLIORE PRATICA DI SICUREZZA)
+# TOKEN = "7305825990:AAHQYjZ54g8TqmEgjV26sPEAF3V_W9FKeVc" # NON USARE HARDCODED TOKEN IN PRODUZIONE
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") # Leggi il token da una variabile d'ambiente
+if not TOKEN:
+    logger.error("La variabile d'ambiente TELEGRAM_BOT_TOKEN non è impostata.")
+    exit(1)
+
 CHOOSE_CATEGORY, ASK_QUESTION = range(2)
 user_data = {}
 
@@ -53,14 +62,24 @@ async def save_score(user_id: int, username: str, category: str, score: int, tot
     conn.close()
 
 # Generazione immagine punteggio
+# ASSICURATI che "arial.ttf" sia disponibile nel tuo container.
+# Potrebbe essere necessario installare un pacchetto di font come `fonts-dejavu-core`
+# nel tuo Dockerfile o fornire il file del font.
 async def generate_score_image(user_data: dict, user_id: int):
     try:
         img = Image.new('RGB', (800, 400), color=(58, 95, 205))
         d = ImageDraw.Draw(img)
         
-        font_large = ImageFont.truetype("arial.ttf", 40)
-        font_medium = ImageFont.truetype("arial.ttf", 30)
-        
+        # Carica il font. Se 'arial.ttf' non funziona, prova un font predefinito
+        # o installane uno nel Dockerfile e usa il percorso completo.
+        try:
+            font_large = ImageFont.truetype("arial.ttf", 40)
+            font_medium = ImageFont.truetype("arial.ttf", 30)
+        except IOError:
+            logger.warning("Font 'arial.ttf' non trovato, usando il font predefinito.")
+            font_large = ImageFont.load_default()
+            font_medium = ImageFont.load_default()
+
         d.text((50, 50), "Certificato Quiz Sanitario", fill=(255, 255, 255), font=font_large)
         
         lines = [
@@ -100,6 +119,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     try:
+        # Assicurati che quiz.xlsx sia nella directory di lavoro del container
         quiz_df = pd.read_excel("quiz.xlsx")
         categories = quiz_df["categoria"].dropna().unique().tolist()
         
@@ -112,6 +132,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
         return CHOOSE_CATEGORY
+    except FileNotFoundError:
+        logger.error("Il file 'quiz.xlsx' non è stato trovato!")
+        await update.message.reply_text("⚠️ Il file dei quiz non è stato trovato. Contatta l'amministratore.")
+        return ConversationHandler.END
     except Exception as e:
         logger.error(f"Errore avvio bot: {e}")
         await update.message.reply_text("⚠️ Errore nel caricamento dei quiz. Riprova più tardi.")
@@ -205,6 +229,7 @@ async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # Invia prima l'immagine se esiste
+    # Verifica che l'immagine esista e sia leggibile nel container
     if image_path and os.path.exists(image_path):
         with open(image_path, 'rb') as photo:
             img_msg = await context.bot.send_photo(
@@ -215,6 +240,10 @@ async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             data["last_messages"].append(img_msg.message_id)
             time.sleep(0.5)  # Piccolo delay per l'effetto visivo
+    else:
+        if image_path:
+            logger.warning(f"Immagine non trovata o percorso errato: {image_path}")
+
 
     # Invia la domanda
     msg = await context.bot.send_message(
@@ -253,7 +282,8 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["last_messages"].append(msg.message_id)
 
     # Delay prima della prossima domanda
-    time.sleep(DELAY_BEFORE_NEXT_QUESTION)
+    # time.sleep(DELAY_BEFORE_NEXT_QUESTION) # non usare time.sleep() in contesti async web server
+    await asyncio.sleep(DELAY_BEFORE_NEXT_QUESTION) # Usa asyncio.sleep() per non bloccare il server
     
     data["current"] += 1
     return await ask_question(update, context)
@@ -304,18 +334,25 @@ async def handle_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "share_image":
         img_path = await generate_score_image(data, user_id)
         if img_path:
-            await context.bot.send_photo(
-                chat_id=user_id,
-                photo=open(img_path, 'rb'),
-                caption=f"Condividi il tuo risultato! @{context.bot.username}",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "Condividi", 
-                        switch_inline_query="Guarda il mio certificato!"
+            try:
+                with open(img_path, 'rb') as img_file: # Assicurati di aprire il file
+                    await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=InputFile(img_file),
+                        caption=f"Condividi il tuo risultato! @{context.bot.username}",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton(
+                                "Condividi", 
+                                switch_inline_query="Guarda il mio certificato!"
+                            )
+                        ]])
                     )
-                ]])
-            )
-            os.remove(img_path)
+            except Exception as e:
+                logger.error(f"Errore nell'invio dell'immagine: {e}")
+                await query.edit_message_text("⚠️ Errore nell'invio dell'immagine.")
+            finally:
+                if os.path.exists(img_path): # Assicurati di eliminare il file temporaneo
+                    os.remove(img_path)
         else:
             await query.edit_message_text("⚠️ Errore nella generazione dell'immagine")
     
@@ -346,8 +383,32 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Quiz annullato.")
     return ConversationHandler.END
 
+# --- Funzione main modificata per Webhook ---
+import asyncio # Importa asyncio
+
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    # Recupera le variabili d'ambiente fornite da Cloud Run
+    PORT = int(os.environ.get("PORT", 8080))
+    WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME") # O CLOUD_RUN_SERVICE_URL
+    # Se RENDER_EXTERNAL_HOSTNAME non è disponibile, potresti dover ottenere l'URL del servizio Cloud Run
+    # dalla console o da 'gcloud run services describe YOUR_SERVICE_NAME --platform managed --region YOUR_REGION --format "value(status.url)"'
+    # e passarlo come variabile d'ambiente, ad esempio CLOUD_RUN_URL.
+    if not WEBHOOK_URL:
+        logger.error("La variabile d'ambiente dell'URL del webhook non è impostata. Il bot potrebbe non funzionare correttamente.")
+        # Potresti voler ottenere l'URL del servizio Cloud Run qui se non è un ambiente come Render.com
+        # Per Cloud Run, l'URL è tipicamente l'URL predefinito del servizio.
+        # Sarà necessario impostare TELEGRAM_WEBHOOK_URL nelle variabili d'ambiente di Cloud Run.
+        WEBHOOK_URL = os.environ.get("TELEGRAM_WEBHOOK_URL")
+        if not WEBHOOK_URL:
+            logger.error("Nessun URL del webhook disponibile. Il bot non può avviarsi correttamente.")
+            exit(1)
+
+
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -358,12 +419,22 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(share_options, pattern="^share_options$"))
-    app.add_handler(CallbackQueryHandler(handle_share, pattern="^(share_text|share_image|show_leaderboard)$"))
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(share_options, pattern="^share_options$"))
+    application.add_handler(CallbackQueryHandler(handle_share, pattern="^(share_text|share_image|show_leaderboard)$"))
     
     logger.info("Bot avviato")
-    app.run_polling()
+
+    # Imposta il webhook (Telegram deve sapere dove inviare gli aggiornamenti)
+    # Questa operazione va fatta una sola volta e puoi anche farla manualmente o con uno script esterno
+    # ma per semplicità la mettiamo qui.
+    # Assicurati che WEBHOOK_URL sia l'URL HTTPS completo del tuo servizio Cloud Run.
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path="", # Per Telegram, l'url_path è tipicamente vuoto se non specifichi una rotta
+        webhook_url=WEBHOOK_URL
+    )
 
 if __name__ == "__main__":
     main()
