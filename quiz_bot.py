@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 import pandas as pd
+import asyncio  # Importa asyncio per operazioni asincrone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -15,24 +16,39 @@ from telegram.ext import (
     CallbackQueryHandler,
     ConversationHandler,
 )
+from flask import Flask, request, Response # Importa Flask e i suoi componenti
 
-# Aggiungi per i webhook (se non usi Flask/FastAPI direttamente)
-from telegram.ext import WebhookHandler
-
-# Configurazione
+# Configurazione del logger
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Recupera il token da una variabile d'ambiente (MIGLIORE PRATICA DI SICUREZZA)
-# TOKEN = "7305825990:AAHQYjZ54g8TqmEgjV26sPEAF3V_W9FKeVc" # NON USARE HARDCODED TOKEN IN PRODUZIONE
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") # Leggi il token da una variabile d'ambiente
+# Recupera il token del bot e l'URL del servizio da variabili d'ambiente
+# TELEGRAM_BOT_TOKEN deve essere impostato su Cloud Run
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
-    logger.error("La variabile d'ambiente TELEGRAM_BOT_TOKEN non è impostata.")
+    logger.error("La variabile d'ambiente TELEGRAM_BOT_TOKEN non è impostata. Il bot non può avviarsi.")
     exit(1)
 
+# K_SERVICE_URL è una variabile d'ambiente fornita da Cloud Run con l'URL del servizio
+# Useremo questo per costruire l'URL del webhook di Telegram.
+CLOUD_RUN_URL = os.environ.get("K_SERVICE_URL")
+if not CLOUD_RUN_URL:
+    logger.error("La variabile d'ambiente K_SERVICE_URL non è impostata. Il bot non può impostare il webhook.")
+    exit(1)
+
+# L'URL completo per il webhook di Telegram deve includere il token per sicurezza e routing.
+WEBHOOK_TELEGRAM_URL = f"{CLOUD_RUN_URL}/{TOKEN}"
+
+# Inizializzazione dell'applicazione Flask
+app = Flask(__name__)
+
+# Inizializzazione dell'applicazione Telegram una volta all'avvio del contenitore
+application = ApplicationBuilder().token(TOKEN).build()
+
+# Costanti per la ConversationHandler
 CHOOSE_CATEGORY, ASK_QUESTION = range(2)
 user_data = {}
 
@@ -51,7 +67,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
+# init_db() verrà chiamato nel blocco if __name__ == "__main__"
 
 async def save_score(user_id: int, username: str, category: str, score: int, total: int):
     conn = sqlite3.connect('scores.db')
@@ -62,21 +78,26 @@ async def save_score(user_id: int, username: str, category: str, score: int, tot
     conn.close()
 
 # Generazione immagine punteggio
-# ASSICURATI che "arial.ttf" sia disponibile nel tuo container.
+# ASSICURATI che un font compatibile sia disponibile nel tuo container.
 # Potrebbe essere necessario installare un pacchetto di font come `fonts-dejavu-core`
-# nel tuo Dockerfile o fornire il file del font.
+# nel tuo Dockerfile o fornire il file del font (es. copiandolo nella directory).
 async def generate_score_image(user_data: dict, user_id: int):
     try:
         img = Image.new('RGB', (800, 400), color=(58, 95, 205))
         d = ImageDraw.Draw(img)
         
         # Carica il font. Se 'arial.ttf' non funziona, prova un font predefinito
-        # o installane uno nel Dockerfile e usa il percorso completo.
+        # o installane uno nel Dockerfile e usa il percorso completo (es. "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf").
         try:
-            font_large = ImageFont.truetype("arial.ttf", 40)
-            font_medium = ImageFont.truetype("arial.ttf", 30)
+            # Assicurati che questo percorso sia corretto nel tuo container
+            font_path = os.path.join(os.getcwd(), "arial.ttf") # Se copi 'arial.ttf' nella root del progetto
+            if not os.path.exists(font_path):
+                 # Prova un percorso comune per font di sistema in Debian/Ubuntu
+                 font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            font_large = ImageFont.truetype(font_path, 40)
+            font_medium = ImageFont.truetype(font_path, 30)
         except IOError:
-            logger.warning("Font 'arial.ttf' non trovato, usando il font predefinito.")
+            logger.warning("Font non trovato, usando il font predefinito.")
             font_large = ImageFont.load_default()
             font_medium = ImageFont.load_default()
 
@@ -92,7 +113,7 @@ async def generate_score_image(user_data: dict, user_id: int):
         for i, line in enumerate(lines):
             d.text((50, 120 + i*50), line, fill=(255, 255, 255), font=font_medium)
         
-        img_path = f"temp_score_{user_id}.png"
+        img_path = f"/tmp/temp_score_{user_id}.png" # Salva in /tmp per Cloud Run (filesystem scrivibile)
         img.save(img_path)
         return img_path
     except Exception as e:
@@ -105,7 +126,9 @@ async def delete_previous_messages(context, chat_id, message_ids):
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception as e:
-            logger.error(f"Errore cancellazione messaggio {msg_id}: {e}")
+            # Ignora errori se il messaggio è già stato cancellato o non esiste
+            if "message to delete not found" not in str(e):
+                logger.error(f"Errore cancellazione messaggio {msg_id}: {e}")
 
 # Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,11 +149,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton(f"📚 {cat.title()}", callback_data=cat)] for cat in categories]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update.message.reply_text(
+        sent_message = await update.message.reply_text(
             "👋 Benvenuto al *Quiz Bot!*\n\nScegli una categoria:",
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN
         )
+        user_data[user_id]["last_messages"].append(sent_message.message_id) # Aggiungi il messaggio al tracking
         return CHOOSE_CATEGORY
     except FileNotFoundError:
         logger.error("Il file 'quiz.xlsx' non è stato trovato!")
@@ -215,6 +239,9 @@ async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = data["questions"][data["current"]]
     options = q["opzioni"].split(";") if isinstance(q["opzioni"], str) else []
     data["correct_answer"] = q["risposta"]
+    
+    # IMPORTANTE: Se usi immagini, devono essere presenti nel contenitore.
+    # Assicurati che il tuo Dockerfile copi anche la cartella delle immagini.
     image_path = q["immagine"] if "immagine" in q and pd.notna(q["immagine"]) else None
 
     keyboard = [[InlineKeyboardButton(opt, callback_data=opt)] for opt in options]
@@ -229,19 +256,21 @@ async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # Invia prima l'immagine se esiste
-    # Verifica che l'immagine esista e sia leggibile nel container
     if image_path and os.path.exists(image_path):
-        with open(image_path, 'rb') as photo:
-            img_msg = await context.bot.send_photo(
-                chat_id=user_id,
-                photo=InputFile(photo),
-                caption=" ",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            data["last_messages"].append(img_msg.message_id)
-            time.sleep(0.5)  # Piccolo delay per l'effetto visivo
+        try:
+            with open(image_path, 'rb') as photo:
+                img_msg = await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=InputFile(photo),
+                    caption=" ", # Didascalia vuota o personalizzata
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                data["last_messages"].append(img_msg.message_id)
+                await asyncio.sleep(0.5) # Piccolo delay per l'effetto visivo
+        except Exception as e:
+            logger.warning(f"Impossibile inviare immagine {image_path}: {e}")
     else:
-        if image_path:
+        if image_path: # Se il percorso dell'immagine è definito ma il file non esiste
             logger.warning(f"Immagine non trovata o percorso errato: {image_path}")
 
 
@@ -282,7 +311,6 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["last_messages"].append(msg.message_id)
 
     # Delay prima della prossima domanda
-    # time.sleep(DELAY_BEFORE_NEXT_QUESTION) # non usare time.sleep() in contesti async web server
     await asyncio.sleep(DELAY_BEFORE_NEXT_QUESTION) # Usa asyncio.sleep() per non bloccare il server
     
     data["current"] += 1
@@ -298,6 +326,7 @@ async def share_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🏆 Mostra classifica", callback_data="show_leaderboard")]
     ]
     
+    # Edita il messaggio del pulsante per mostrare le nuove opzioni
     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
 
 async def handle_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -306,7 +335,7 @@ async def handle_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = user_data.get(user_id, {})
     
-    if not data:
+    if not data or 'questions' not in data or not data['questions']: # Aggiungi controllo per 'questions'
         await query.edit_message_text("⚠️ Completa prima un quiz con /start")
         return
 
@@ -326,7 +355,7 @@ async def handle_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "Condividi in un gruppo", 
-                    switch_inline_query=share_text.split('\n\n')[0]
+                    switch_inline_query=share_text.split('\n\n')[0] # Prende la prima riga come query inline
                 )
             ]])
         )
@@ -361,13 +390,16 @@ async def handle_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c = conn.cursor()
         c.execute('''SELECT username, score, total FROM scores 
                      WHERE category = ? ORDER BY score DESC LIMIT 10''',
-                  (data['category'],))
+                    (data['category'],))
         top_scores = c.fetchall()
         conn.close()
         
         leaderboard = "🏆 *Classifica Top 10*\n\n"
-        for i, (username, score, total) in enumerate(top_scores):
-            leaderboard += f"{i+1}. @{username}: {score}/{total}\n"
+        if not top_scores:
+            leaderboard += "Nessun punteggio registrato per questa categoria."
+        else:
+            for i, (username, score, total) in enumerate(top_scores):
+                leaderboard += f"{i+1}. @{username}: {score}/{total}\n"
         
         await query.edit_message_text(
             text=leaderboard,
@@ -383,58 +415,59 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Quiz annullato.")
     return ConversationHandler.END
 
-# --- Funzione main modificata per Webhook ---
-import asyncio # Importa asyncio
-
-def main():
-    # Recupera le variabili d'ambiente fornite da Cloud Run
-    PORT = int(os.environ.get("PORT", 8080))
-    WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME") # O CLOUD_RUN_SERVICE_URL
-    # Se RENDER_EXTERNAL_HOSTNAME non è disponibile, potresti dover ottenere l'URL del servizio Cloud Run
-    # dalla console o da 'gcloud run services describe YOUR_SERVICE_NAME --platform managed --region YOUR_REGION --format "value(status.url)"'
-    # e passarlo come variabile d'ambiente, ad esempio CLOUD_RUN_URL.
-    if not WEBHOOK_URL:
-        logger.error("La variabile d'ambiente dell'URL del webhook non è impostata. Il bot potrebbe non funzionare correttamente.")
-        # Potresti voler ottenere l'URL del servizio Cloud Run qui se non è un ambiente come Render.com
-        # Per Cloud Run, l'URL è tipicamente l'URL predefinito del servizio.
-        # Sarà necessario impostare TELEGRAM_WEBHOOK_URL nelle variabili d'ambiente di Cloud Run.
-        WEBHOOK_URL = os.environ.get("TELEGRAM_WEBHOOK_URL")
-        if not WEBHOOK_URL:
-            logger.error("Nessun URL del webhook disponibile. Il bot non può avviarsi correttamente.")
-            exit(1)
+# Aggiungi gli handler all'applicazione Telegram una sola volta
+application.add_handler(ConversationHandler(
+    entry_points=[CommandHandler("start", start)],
+    states={
+        CHOOSE_CATEGORY: [CallbackQueryHandler(choose_category)],
+        ASK_QUESTION: [CallbackQueryHandler(answer_question)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+))
+application.add_handler(CallbackQueryHandler(share_options, pattern="^share_options$"))
+application.add_handler(CallbackQueryHandler(handle_share, pattern="^(share_text|share_image|show_leaderboard)$"))
 
 
-    application = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .build()
-    )
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            CHOOSE_CATEGORY: [CallbackQueryHandler(choose_category)],
-            ASK_QUESTION: [CallbackQueryHandler(answer_question)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(share_options, pattern="^share_options$"))
-    application.add_handler(CallbackQueryHandler(handle_share, pattern="^(share_text|share_image|show_leaderboard)$"))
+# Endpoint Flask per il webhook di Telegram
+# Cloud Run invierà le richieste POST a questo percorso.
+@app.route(f"/{TOKEN}", methods=["POST"])
+async def telegram_webhook():
+    # Ottieni i dati JSON dalla richiesta POST
+    req_body = request.get_json(force=True)
     
-    logger.info("Bot avviato")
+    # Crea un oggetto Update da Telegram e processalo con la tua applicazione bot
+    update = Update.de_json(req_body, application.bot)
+    
+    # Processa l'update in modo asincrono
+    await application.process_update(update)
+    
+    # Cloud Run si aspetta una risposta HTTP 200 OK.
+    return Response(status=200)
 
-    # Imposta il webhook (Telegram deve sapere dove inviare gli aggiornamenti)
-    # Questa operazione va fatta una sola volta e puoi anche farla manualmente o con uno script esterno
-    # ma per semplicità la mettiamo qui.
-    # Assicurati che WEBHOOK_URL sia l'URL HTTPS completo del tuo servizio Cloud Run.
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="", # Per Telegram, l'url_path è tipicamente vuoto se non specifichi una rotta
-        webhook_url=WEBHOOK_URL
-    )
+# Endpoint per il health check di Cloud Run (opzionale ma consigliato)
+@app.route("/_ah/health")
+def health_check():
+    return "ok", 200
 
+# Blocco principale per l'avvio del server Flask
 if __name__ == "__main__":
-    main()
+    # Inizializza il database all'avvio del contenitore
+    init_db()
+
+    # Imposta il webhook di Telegram al primo avvio del server
+    # Questo dice a Telegram dove inviare gli aggiornamenti.
+    # È un'operazione che va fatta una sola volta o ogni volta che l'URL del servizio cambia.
+    try:
+        # Await la chiamata a set_webhook in un contesto asincrono
+        asyncio.run(application.bot.set_webhook(url=WEBHOOK_TELEGRAM_URL))
+        logger.info(f"Webhook di Telegram impostato su: {WEBHOOK_TELEGRAM_URL}")
+    except Exception as e:
+        logger.error(f"Errore nell'impostazione del webhook di Telegram: {e}")
+        # Non uscire, il server Flask deve comunque avviarsi per ricevere richieste.
+
+    # Avvia l'applicazione Flask.
+    # Cloud Run fornirà la PORT come variabile d'ambiente.
+    # Flask si metterà in ascolto su tutte le interfacce (0.0.0.0) sulla porta specificata.
+    PORT = int(os.environ.get("PORT", 8080))
+    logger.info(f"Avvio del server Flask sulla porta {PORT}")
+    app.run(host="0.0.0.0", port=PORT)
